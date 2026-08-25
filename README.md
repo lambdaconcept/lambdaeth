@@ -59,7 +59,7 @@ LambdaEth expects its (patched) dependencies as sibling checkouts:
 workspace/
 ├── lambdaeth/          # this repository
 ├── amaranth-soc/       # https://github.com/key2/amaranth-soc        @ 559658d
-├── amaranth-stream/    # https://github.com/key2/amaranth-stream     @ 4106428  + patches/amaranth-stream.diff
+├── amaranth-stream/    # https://github.com/key2/amaranth-stream     @ fc42307
 └── amaranth-boards/    # https://github.com/amaranth-lang/amaranth-boards @ f270d21 + patches/amaranth-boards.diff
 ```
 
@@ -69,7 +69,6 @@ git clone https://github.com/key2/amaranth-soc
 git clone https://github.com/key2/amaranth-stream
 git clone https://github.com/amaranth-lang/amaranth-boards
 
-git -C amaranth-stream apply ../lambdaeth/patches/amaranth-stream.diff   # Depacketizer.header_raw + runt resync
 git -C amaranth-boards apply ../lambdaeth/patches/amaranth-boards.diff   # Tang Mega 138K Pro: RGMII/ephy_clk resources, UART pins, GW5A part parsing
 
 cd lambdaeth
