@@ -35,16 +35,19 @@ v1 scope (deliberate, mirrors how UDP/ICMP were landed):
 * One connection per engine. Both modes only ever *close passively*: the
   peer sends the first FIN (CLOSE-WAIT → LAST-ACK; no FIN-WAIT/TIME-WAIT).
   A lost peer is reaped by an idle timeout (RST + back to start).
-* Stop-and-wait TX: a single in-flight segment (<= ``mss``), retransmitted
-  from a replay buffer on timeout; the connection is aborted after
-  ``max_retries``. User packets larger than ``mss`` are split; a segment is
-  launched at ``mss`` bytes or at the user's ``last``.
+* Stop-and-wait TX: a single in-flight segment, retransmitted from a replay
+  buffer on timeout; the connection is aborted after ``max_retries``.
+  Segments are cut at the *effective* MSS — ``min(mss, peer MSS, 536 when
+  the peer sent no option)`` — or at the user's ``last``; larger user
+  packets are split.
 * RX: in-order only. Out-of-order/unacceptable segments are dropped and
   answered with a duplicate ACK (the peer retransmits). Every acceptable
   data/FIN segment is ACKed immediately. The advertised window tracks the
   free space of the internal RX buffer, so accepted data is never lost.
-* No options are sent (the peer falls back to a 536-byte MSS); received
-  options are skipped (and checksummed). No congestion control, window
+* The MSS option is the only option used: SYN/SYN-ACK advertise ``mss``
+  (so the peer may fill our buffers, e.g. ``mss=1460`` for full frames)
+  and the peer's MSS is parsed and honoured on TX. All other received
+  options are skipped (but checksummed). No congestion control, window
   scaling, SACK, Nagle, zero-window probing, delayed ACKs, or simultaneous
   open.
 * ``close`` is only honoured in CLOSE-WAIT (after ``peer_closed``): assert it
@@ -144,7 +147,8 @@ class TCPRX(wiring.Component):
     received TCP packets with ``src_ip``/``ip_length`` metadata from the IP
     RX layer (``ip_length`` is authoritative — frames carry Ethernet
     padding). The TCP checksum is verified over the pseudo-header, header,
-    options and payload; options are then discarded.
+    options and payload; the MSS option value is extracted into the segment
+    metadata (0 when absent) and the options are otherwise discarded.
 
     A verified segment is *presented*: ``seg_stb`` is held with the metadata
     on ``seg`` while the payload may be read from ``seg_payload``; the
