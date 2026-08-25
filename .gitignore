@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pdm-python
+.pdm-build/
+.pytest_cache/
+dist/
+build/
+pdm.lock
+*.vcd
+*.gtkw

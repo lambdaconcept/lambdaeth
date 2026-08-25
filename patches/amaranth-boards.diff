@@ -1,0 +1,84 @@
+diff --git a/amaranth_boards/tang_mega_138k_pro_dock.py b/amaranth_boards/tang_mega_138k_pro_dock.py
+index 59dbd9d..12121ee 100644
+--- a/amaranth_boards/tang_mega_138k_pro_dock.py
++++ b/amaranth_boards/tang_mega_138k_pro_dock.py
+@@ -1,4 +1,5 @@
+ import os
++import re
+ import subprocess
+ 
+ from amaranth.build import *
+@@ -14,6 +15,43 @@ class TangMega138kProDockPlatform(GowinPlatform):
+     part          = "GW5AST-LV138FPG676AC1/I0"
+     family        = "GW5AST-138B"
+     default_clk   = "clk50"
++
++    def parse_part(self):
++        # GW5A(S/T)-aware version of GowinPlatform.parse_part (the upstream
++        # regexes only cover the GW1/GW2 series).
++        reg_series    = r"(GW[125]{1}[AN]{1}[EFNRSZT]{0,3})-"
++        reg_voltage   = r"(ZV|EV|LV|LX|UV|UX)"
++        reg_size      = r"(138|15|18|25|55|60|1|2|4|9)"
++        reg_subseries = r"(?:(B|C|S|X|P5)?)"
++        reg_package   = r"((?:FPG|PG|UG|EQ|LQ|MG|M|QN|CS|FN)(?:\d+)(?:P?)(?:A|E|M|CF|C|D|G|H|F|S|T|U|X)?)"
++        reg_speed     = r"((?:C\d{1}/I\d{1})|ES|A\d{1}|I\d{1})"
++
++        match = re.match(reg_series+reg_voltage+reg_size+reg_subseries+reg_package+reg_speed+"$",
++                         self.part)
++        if not match:
++            raise ValueError("Supplied part name is invalid")
++
++        self.series    = match.group(1)
++        self.voltage   = match.group(2)
++        self.size      = match.group(3)
++        self.subseries = match.group(4) or ""
++        self.package   = match.group(5)
++        self.speed     = match.group(6)
++
++        match = re.match(reg_series+reg_size+reg_subseries+"$", self.family)
++        if not match:
++            raise ValueError("Supplied device family name is invalid")
++
++        self.series_f    = match.group(1)
++        self.size_f      = match.group(2)
++        self.subseries_f = match.group(3) or ""
++
++        if self.series != self.series_f:
++            raise ValueError("Series extracted from supplied part name does not match "
++                             "supplied family series")
++        if self.size != self.size_f:
++            raise ValueError("Size extracted from supplied part name does not match "
++                             "supplied family size")
+     resources     = [
+         Resource("clk50", 0, Pins("P16", dir="i"),
+                  Clock(50e6), Attrs(IO_TYPE="LVCMOS33")),
+@@ -30,8 +68,28 @@ class TangMega138kProDockPlatform(GowinPlatform):
+         Resource("ws2812", 0, Pins("H16", dir="o"),
+                  Attrs(IO_TYPE="LVCMOS33")),
+ 
+-        UARTResource(0, rx="P15", tx="N16",
++        # Pin orientation matches litex-boards (FPGA rx=N16, tx=P15), proven
++        # with the on-board FT2232 debugger UART (channel B).
++        UARTResource(0, rx="N16", tx="P15",
+             attrs=Attrs(PULL_MODE="UP", IO_TYPE="LVCMOS33")),
++
++        # RGMII Ethernet (RTL8211F). The PHY has no crystal on this dock: the
++        # FPGA must output a 25 MHz clock on ephy_clk (E18).
++        Resource("eth_clocks", 0,
++            Subsignal("tx", Pins("H24", dir="o")),
++            Subsignal("rx", Pins("C23", dir="i")),
++            Attrs(IO_TYPE="LVCMOS33")),
++        Resource("eth", 0,
++            Subsignal("rst_n",   Pins("E17", dir="o")),
++            Subsignal("mdio",    Pins("K22", dir="io")),
++            Subsignal("mdc",     Pins("K23", dir="o")),
++            Subsignal("rx_ctl",  Pins("C22", dir="i")),
++            Subsignal("rx_data", Pins("B26 C26 D26 E26", dir="i")),
++            Subsignal("tx_ctl",  Pins("J24", dir="o")),
++            Subsignal("tx_data", Pins("K21 J21 L19 K18", dir="o")),
++            Attrs(IO_TYPE="LVCMOS33")),
++        Resource("ephy_clk", 0, Pins("E18", dir="o"),
++            Attrs(IO_TYPE="LVCMOS33")),
+     ]
+ 
+     connectors = [

@@ -1,0 +1,46 @@
+[project]
+name = "lambdaeth"
+version = "0.1.0"
+description = "Ethernet core for Amaranth HDL (LiteEth port), built on amaranth-soc and amaranth-stream"
+authors = [
+    {name = "key2", email = "key2@users.noreply.github.com"},
+]
+requires-python = ">=3.11"
+readme = "README.md"
+license = {text = "BSD-2-Clause"}
+dependencies = [
+    "amaranth[builtin-yosys]>=0.5.9",
+]
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+[tool.pdm]
+distribution = true
+
+# amaranth-soc and amaranth-stream are local, modifiable checkouts; install them
+# editable so improvements made there are picked up immediately.
+[tool.pdm.dev-dependencies]
+dev = [
+    "-e file:///${PROJECT_ROOT}/../amaranth-soc#egg=amaranth-soc",
+    "-e file:///${PROJECT_ROOT}/../amaranth-stream#egg=amaranth-stream",
+    "-e file:///${PROJECT_ROOT}/../amaranth-boards#egg=amaranth-boards",
+]
+
+[tool.pdm.scripts]
+test.cmd = "pytest tests -v"
+gen-gw5rgmii.cmd = "python examples/gen_gw5rgmii.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    # Construction-only tests inspect components without elaborating them;
+    # their inner CSR field actions then warn at garbage collection.
+    "ignore::amaranth.hdl.UnusedElaboratable",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]

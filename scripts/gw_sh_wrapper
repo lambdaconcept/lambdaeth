@@ -1,0 +1,20 @@
+#!/bin/sh
+# Headless wrapper for the Gowin IDE gw_sh TCL shell.
+#
+# - LD_PRELOAD of the system freetype fixes the bundled-fontconfig symbol clash.
+# - QT_QPA_PLATFORM=offscreen with the bundled Qt plugins runs without a display.
+# - QT_IM_MODULE=none prevents loading the system ibus plugin (Qt version mix).
+# - License: IDE/bin/gwlicense.ini points at the Sipeed floating license server
+#   (106.55.34.119:10559 / gowinlic.sipeed.com).
+#
+# Used by Amaranth builds via:  export GW_SH=/path/to/this/script
+
+GOWIN_IDE="${GOWIN_IDE:-/home/key2/Downloads/gowin/IDE}"
+
+unset XDG_SESSION_TYPE WAYLAND_DISPLAY XMODIFIERS
+export QT_IM_MODULE=none
+export QT_QPA_PLATFORM=offscreen
+export QT_PLUGIN_PATH="$GOWIN_IDE/plugins/qt"
+export LD_PRELOAD=/lib/x86_64-linux-gnu/libfreetype.so.6
+
+exec "$GOWIN_IDE/bin/gw_sh" "$@"
