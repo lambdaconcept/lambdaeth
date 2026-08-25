@@ -122,6 +122,7 @@ def tcp_seg_layout():
         "flags":     8,
         "window":   16,
         "length":   16,     # Payload length (after options), in bytes.
+        "mss":      16,     # MSS option value (0 when absent).
     })
 
 
@@ -227,6 +228,13 @@ class TCPRX(wiring.Component):
             self.seg.src_ip.eq(src_ip),
         ]
 
+        # Option walker (only the MSS option is interpreted; everything is
+        # checksummed regardless). Kind 0 ends the list, kind 1 has no
+        # length byte, other kinds are kind/len/value with len covering all.
+        opt_phase = Signal(2)           # 0 kind, 1 len, 2 value, 3 done.
+        opt_kind  = Signal(8)
+        opt_left  = Signal(8)
+
         sink_to_depack = [
             depack.i_stream.valid.eq(self.sink.valid),
             depack.i_stream.payload.eq(self.sink.payload),
@@ -278,6 +286,8 @@ class TCPRX(wiring.Component):
                         meta.ack.eq(bswap(hdr.ack)),
                         meta.flags.eq(hdr.flags),
                         meta.window.eq(bswap(hdr.window)),
+                        meta.mss.eq(0),
+                        opt_phase.eq(0),
                         acc.eq(hdr_sum),
                         opt_len.eq((data_offset - 5) * 4),
                         plen.eq(seg_total - (data_offset * 4)),
@@ -298,7 +308,7 @@ class TCPRX(wiring.Component):
                     m.next = "IDLE"
 
             with m.State("OPTIONS"):
-                # Consume and checksum the options without storing them.
+                # Consume and checksum the options; pick out the MSS value.
                 m.d.comb += sink_to_depack
                 m.d.comb += depack.o_stream.ready.eq(1)
                 with m.If(depack.o_stream.valid):
@@ -306,6 +316,30 @@ class TCPRX(wiring.Component):
                         acc.eq(acc_folded),
                         count.eq(count + 1),
                     ]
+                    data = depack.o_stream.payload
+                    with m.Switch(opt_phase):
+                        with m.Case(0):                     # Option kind.
+                            with m.If(data == 0):           # End of list.
+                                m.d.sync += opt_phase.eq(3)
+                            with m.Elif(data != 1):         # 1 = NOP.
+                                m.d.sync += [
+                                    opt_kind.eq(data),
+                                    opt_phase.eq(1),
+                                ]
+                        with m.Case(1):                     # Option length.
+                            with m.If(data < 2):            # Malformed.
+                                m.d.sync += opt_phase.eq(3)
+                            with m.Else():
+                                m.d.sync += opt_left.eq(data - 2)
+                                m.d.sync += opt_phase.eq(
+                                    Mux(data == 2, 0, 2))
+                        with m.Case(2):                     # Option value.
+                            with m.If(opt_kind == 2):       # MSS.
+                                m.d.sync += meta.mss.eq(
+                                    Cat(data, meta.mss[:8]))
+                            m.d.sync += opt_left.eq(opt_left - 1)
+                            with m.If(opt_left == 1):
+                                m.d.sync += opt_phase.eq(0)
                     with m.If(depack.o_stream.last & (count != opt_len - 1)):
                         # Truncated inside the options.
                         m.d.comb += self.drop.eq(1)
@@ -506,10 +540,20 @@ class TCPEngine(wiring.Component):
         snd_una   = Signal(32)
         snd_nxt   = Signal(32)
         peer_wnd  = Signal(16)
+        eff_mss   = Signal(range(self.mss + 1), init=min(self.mss, 536))
         iss_ctr   = Signal(32)
         retries   = Signal(range(self.max_retries + 1))
         close_req = Signal()
         m.d.sync += iss_ctr.eq(iss_ctr + 1)
+
+        # Send-side segment limit: our buffer vs the peer's MSS option
+        # (536 when absent, per RFC). Latched at connection setup.
+        peer_lim = Signal(16)
+        eff_next = Signal(range(self.mss + 1))
+        m.d.comb += [
+            peer_lim.eq(Mux(self.seg.mss != 0, self.seg.mss, 536)),
+            eff_next.eq(Mux(peer_lim < self.mss, peer_lim, self.mss)),
+        ]
 
         outstanding = Signal()
         m.d.comb += outstanding.eq(snd_nxt != snd_una)
@@ -546,7 +590,7 @@ class TCPEngine(wiring.Component):
                 fill_len.eq(fill_len + 1),
                 pay_sum.eq(user_add[:16] + user_add[16]),
             ]
-            with m.If(self.tx_sink.last | (fill_len == self.mss - 1)):
+            with m.If(self.tx_sink.last | (fill_len == eff_mss - 1)):
                 m.d.sync += tx_data_pending.eq(1)
 
         # Pending TX causes (p_synack: server opening; p_syn: client opening).
@@ -816,6 +860,7 @@ class TCPEngine(wiring.Component):
                                 snd_una.eq(iss_ctr),
                                 snd_nxt.eq(iss_ctr + 1),
                                 peer_wnd.eq(seg.window),
+                                eff_mss.eq(eff_next),
                                 p_synack.eq(1),
                                 retries.eq(0),
                                 rto_cnt.eq(self.rto_cycles),
@@ -847,6 +892,7 @@ class TCPEngine(wiring.Component):
                                     irs.eq(seg.seq),
                                     rcv_nxt.eq(seg.seq + 1),
                                     peer_wnd.eq(seg.window),
+                                    eff_mss.eq(eff_next),
                                     snd_una.eq(snd_nxt),
                                     retries.eq(0),
                                     p_syn.eq(0),
@@ -901,21 +947,31 @@ class TCPEngine(wiring.Component):
         b_len   = Signal(16)
         csum    = Signal(16)
 
+        # SYN and SYN-ACK carry the MSS option (4 bytes, data offset 6), so
+        # the peer may fill our buffers instead of assuming 536.
+        adv_mss = min(self.mss, 0xffff)
+        b_opt   = Signal()
+        hdr_len = Signal(5)
         m.d.comb += [
+            b_opt.eq((b_kind == KIND_SYN) | (b_kind == KIND_SYNACK)),
+            hdr_len.eq(Mux(b_opt, TCP_HEADER_LEN + 4, TCP_HEADER_LEN)),
             self.dst_ip.eq(b_ip),
-            self.length.eq(TCP_HEADER_LEN + b_len),
+            self.length.eq(hdr_len + b_len),
         ]
 
-        # Checksum accumulation source words (pseudo-header + header).
+        # Checksum accumulation source words (pseudo-header + header + the
+        # optional MSS option words, zero when absent).
         csum_words = Array([
             self.ip_address[16:32], self.ip_address[0:16],     # src (ours)
             b_ip[16:32], b_ip[0:16],                            # dst
-            Const(IPV4_PROTOCOL_TCP, 16), TCP_HEADER_LEN + b_len,
+            Const(IPV4_PROTOCOL_TCP, 16), hdr_len + b_len,
             b_sport, b_dport,
             b_seq[16:32], b_seq[0:16],
             b_ack[16:32], b_ack[0:16],
-            Cat(b_flags, Const(0x50, 8)),                       # offset/flags
+            Cat(b_flags, Mux(b_opt, Const(0x60, 8), Const(0x50, 8))),
             b_wnd, Const(0, 16), Const(0, 16),                  # csum=0, urg
+            Mux(b_opt, Const(0x0204, 16), Const(0, 16)),        # kind 2 len 4
+            Mux(b_opt, Const(adv_mss, 16), Const(0, 16)),
         ])
         csum_idx = Signal(range(len(csum_words) + 1))
         csum_acc = Signal(16)
@@ -929,12 +985,15 @@ class TCPEngine(wiring.Component):
             "seq":         bswap(b_seq),
             "ack":         bswap(b_ack),
             "reserved":    0,
-            "data_offset": 5,
+            "data_offset": Mux(b_opt, 6, 5),
             "flags":       b_flags,
             "window":      bswap(b_wnd),
             "checksum":    bswap(csum),
             "urgent":      0,
         }, name="tcptx_image")
+        opt_image = Array([Const(2, 8), Const(4, 8),
+                           Const(adv_mss >> 8, 8), Const(adv_mss & 0xff, 8)])
+        opt_idx   = Signal(2)
 
         emit_cnt = Signal(range(TCP_HEADER_LEN))
         pay_idx  = Signal(range(self.segbuf_depth + 1))
@@ -1048,16 +1107,33 @@ class TCPEngine(wiring.Component):
                         hdr_image.word_select(emit_cnt, 8)),
                     self.source.first.eq(emit_cnt == 0),
                     self.source.last.eq((emit_cnt == TCP_HEADER_LEN - 1) &
-                                        (b_len == 0)),
+                                        (b_len == 0) & ~b_opt),
                 ]
                 with m.If(self.source.ready):
                     with m.If(emit_cnt == TCP_HEADER_LEN - 1):
-                        with m.If(b_len == 0):
+                        with m.If(b_opt):
+                            m.d.sync += opt_idx.eq(0)
+                            m.next = "EMIT_OPT"
+                        with m.Elif(b_len == 0):
                             m.next = "FINISH"
                         with m.Else():
                             m.next = "EMIT_PAY"
                     with m.Else():
                         m.d.sync += emit_cnt.eq(emit_cnt + 1)
+
+            with m.State("EMIT_OPT"):
+                m.d.comb += [
+                    self.source.valid.eq(1),
+                    self.source.payload.eq(opt_image[opt_idx]),
+                    self.source.last.eq((opt_idx == 3) & (b_len == 0)),
+                ]
+                with m.If(self.source.ready):
+                    m.d.sync += opt_idx.eq(opt_idx + 1)
+                    with m.If(opt_idx == 3):
+                        with m.If(b_len == 0):
+                            m.next = "FINISH"
+                        with m.Else():
+                            m.next = "EMIT_PAY"
 
             with m.State("EMIT_PAY"):
                 m.d.comb += [

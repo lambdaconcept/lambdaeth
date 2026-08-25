@@ -73,7 +73,7 @@ git -C amaranth-boards apply ../lambdaeth/patches/amaranth-boards.diff   # Tang 
 
 cd lambdaeth
 pdm install          # Python >= 3.11; installs the siblings as editable deps
-pdm run pytest -q    # 141 tests
+pdm run pytest -q    # 145 tests
 ```
 
 ## Usage
@@ -217,6 +217,34 @@ Measured on hardware: ICMP RTT ~0.15 ms, UDP echo RTT ~90 µs, TCP echo
 ~70 kB/s per connection (stop-and-wait ⇒ one MSS per RTT — a demo-grade,
 deliberately simple TCP).
 
+### TCP throughput benchmark
+
+SYN/SYN-ACK advertise our MSS (`--tcp-mss`, default 536; 1460 fills
+standard Ethernet frames from BRAM buffers) and the peer's MSS option is
+honoured on TX. A `--tcp-bench` build replaces the first two TCP echo
+servers with a byte *sink* (PC→FPGA, counted in the `bench_rx_bytes` CSR —
+no echoing, so nothing waits on the reverse path) and a pattern *source*
+(FPGA→PC, `bench_tx_bytes`); `scripts/tcp_bench.py` measures both:
+
+```sh
+GW_SH=$PWD/scripts/gw_sh_wrapper pdm run python examples/tang_mega_138k_udp_echo.py \
+    --ip 192.168.10.50 --tcp-bench --tcp-mss 1460 --tcp-rx-depth 8192 --rx-cdc-depth 4096
+pdm run python scripts/tcp_bench.py --ip 192.168.10.50
+```
+
+Measured against a Linux host over gigabit (sys clock 50 MHz):
+
+| Direction | MSS 536 (defaults) | MSS 1460 (bench build) |
+|---|---|---|
+| PC → FPGA (upload) | ~18 MB/s (144 Mbit/s) | **24.75 MB/s (198 Mbit/s)** |
+| FPGA → PC (download) | 5.4 MB/s (43 Mbit/s) | **7.5 MB/s (60 Mbit/s)** |
+
+Upload sits at 99 % of the architectural ceiling: every byte crosses the
+byte-wide core twice (checksum-validating store-and-forward, then the copy
+to the user buffer) ⇒ 50 MHz / 2 = 25 MB/s. Download is stop-and-wait
+(one segment per round trip, ~195 µs each at MSS 1460); a small in-flight
+window would be the next step if that direction ever matters.
+
 ## Host-side tools
 
 | Script | Purpose |
@@ -247,8 +275,10 @@ deliberately simple TCP).
 ## Limitations (v1, by design)
 
 * TCP: one connection per endpoint, in-order RX only, stop-and-wait TX
-  (single in-flight segment, MSS 536, no options sent), passive close only,
-  no congestion control / window scaling / SACK / zero-window probing.
+  (single in-flight segment of up to `tcp_mss` bytes, capped by the peer's
+  MSS option), passive close only, no congestion control / window scaling /
+  SACK / zero-window probing. The MSS option is the only option sent or
+  interpreted.
 * DHCP: broadcast renewal (rebinding style), first OFFER wins, no ARP
   probing / gratuitous announce / DECLINE / RELEASE.
 * CRC-errored frames are flagged but not dropped ahead of the core (a
@@ -259,7 +289,7 @@ deliberately simple TCP).
 ## Testing
 
 ```sh
-pdm run pytest -q          # 141 tests
+pdm run pytest -q          # 145 tests
 ```
 
 Layer tests drive plain MAC frames against Python reference

@@ -113,7 +113,8 @@ class UDPEcho(Elaboratable):
     def __init__(self, mac_addr=DEFAULT_MAC, ip_addr=DEFAULT_IP,
                  sys_clk_freq=50e6, baudrate=115200, with_icmp=True,
                  udp_ports=DEFAULT_UDP_PORTS, tcp_ports=DEFAULT_TCP_PORTS,
-                 with_dhcp=False):
+                 with_dhcp=False, tcp_mss=536, tcp_rx_depth=2048,
+                 rx_cdc_depth=512, tcp_bench=False):
         self.mac_init     = convert_mac(mac_addr)
         self.ip_init      = convert_ip(ip_addr)
         self.sys_clk_freq = sys_clk_freq
@@ -123,7 +124,14 @@ class UDPEcho(Elaboratable):
         self.udp_ports    = [int(port) for port in udp_ports]
         self.tcp_ports    = _normalize_tcp_ports(
             list(tcp_ports) if tcp_ports else None)
+        self.tcp_mss      = tcp_mss
+        self.tcp_rx_depth = tcp_rx_depth
+        self.rx_cdc_depth = rx_cdc_depth
+        self.tcp_bench    = tcp_bench
         assert len(self.udp_ports) >= 1
+        if tcp_bench:
+            assert self.tcp_ports and len(self.tcp_ports) >= 2, \
+                "--tcp-bench needs two TCP ports (sink + source)"
 
         # CSRs (built here so the memory map is available before elaboration).
         # The map itself is shaped by the enabled features.
@@ -131,7 +139,7 @@ class UDPEcho(Elaboratable):
         n_clients = sum(spec.mode == "client" for spec in tcp_specs)
         est = (0x50 + 2 * len(self.udp_ports) + 2 * len(tcp_specs) +
                6 * n_clients + (24 if tcp_specs else 0) +
-               (8 if with_dhcp else 0))
+               (8 if with_dhcp else 0) + (8 if tcp_bench else 0))
         addr_width = max(6, (est - 1).bit_length())
         regs = csr.Builder(addr_width=addr_width, data_width=8)
         self.scratch     = regs.add("scratch",     Scratch())
@@ -177,6 +185,11 @@ class UDPEcho(Elaboratable):
             self.tcp_status   = regs.add("tcp_status", Counter32())
         if with_dhcp:
             self.dhcp_events = regs.add("dhcp_events", Counter32())
+        if tcp_bench:
+            # Benchmark byte counters: PC->FPGA bytes swallowed by the sink
+            # endpoint, FPGA->PC bytes emitted by the source endpoint.
+            self.bench_rx = regs.add("bench_rx_bytes", Counter32())
+            self.bench_tx = regs.add("bench_tx_bytes", Counter32())
         self.csr_bridge  = csr.Bridge(regs.as_memory_map())
         self.memory_map  = self.csr_bridge.bus.memory_map
 
@@ -192,7 +205,8 @@ class UDPEcho(Elaboratable):
             create_domains  = False,
             hw_reset_cycles = int(20e-3 * self.sys_clk_freq),
         )
-        mac = MACCore(phy, data_width=32, with_csr=False, rx_cdc_depth=512)
+        mac = MACCore(phy, data_width=32, with_csr=False,
+                      rx_cdc_depth=self.rx_cdc_depth)
         m.submodules.phy = phy
         m.submodules.mac = mac
         connect(m, mac.phy_tx, phy.tx)
@@ -236,7 +250,9 @@ class UDPEcho(Elaboratable):
                                              with_icmp=self.with_icmp,
                                              udp_ports=self.udp_ports,
                                              tcp_ports=self.tcp_ports,
-                                             with_dhcp=self.with_dhcp)
+                                             with_dhcp=self.with_dhcp,
+                                             tcp_mss=self.tcp_mss,
+                                             tcp_rx_depth=self.tcp_rx_depth)
         m.d.comb += core.mac_address.eq(self.mac_reg.f.value.data)
         if self.with_dhcp:
             m.d.comb += self.dhcp_ip_reg.f.value.r_data.eq(core.dhcp_ip)
@@ -275,34 +291,66 @@ class UDPEcho(Elaboratable):
                     .eq(self.udp_port_regs[i].f.value.data),
             ]
 
-        # One TCP echo loop per endpoint (server or client): rx -> FIFO ->
-        # tx, closing once the peer closed and every received byte was
-        # echoed back.
+        # TCP endpoint fabrics. Default: echo loops (rx -> FIFO -> tx,
+        # closing once the peer closed and every byte went back). With
+        # --tcp-bench, the first endpoint becomes a byte *sink* (PC->FPGA
+        # benchmark, counted in bench_rx_bytes) and the second a pattern
+        # *source* (FPGA->PC benchmark, counted in bench_tx_bytes) — no
+        # echoing, so neither direction waits on the other.
         for i, (name, spec) in enumerate((core.tcp_ports or {}).items()):
-            echo = PacketFIFO(eth_stream_signature(),
-                              payload_depth=2048, packet_depth=8)
-            m.submodules[f"tcp_echo_{name}"] = echo
             rx = getattr(core, f"tcp_rx_{name}")
             tx = getattr(core, f"tcp_tx_{name}")
-            connect(m, rx, echo.i_stream)
-            connect(m, echo.o_stream, tx)
+            connected   = getattr(core, f"tcp_connected_{name}")
+            peer_closed = getattr(core, f"tcp_peer_closed_{name}")
 
-            rx_bytes = Signal(32)
-            tx_bytes = Signal(32)
-            with m.If(rx.valid & rx.ready):
-                m.d.sync += rx_bytes.eq(rx_bytes + 1)
-            with m.If(tx.valid & tx.ready):
-                m.d.sync += tx_bytes.eq(tx_bytes + 1)
+            if self.tcp_bench and i == 0:
+                # Upload sink: swallow everything at one byte per cycle.
+                count = Signal(32)
+                m.d.comb += [
+                    rx.ready.eq(1),
+                    self.bench_rx.f.value.r_data.eq(count),
+                    getattr(core, f"tcp_close_{name}").eq(peer_closed),
+                ]
+                with m.If(rx.valid):
+                    m.d.sync += count.eq(count + 1)
+            elif self.tcp_bench and i == 1:
+                # Download source: stream an incrementing byte pattern while
+                # connected; the engine cuts segments at the effective MSS.
+                count = Signal(32)
+                pattern = Signal(8)
+                m.d.comb += [
+                    tx.valid.eq(connected & ~peer_closed),
+                    tx.payload.eq(pattern),
+                    rx.ready.eq(1),
+                    self.bench_tx.f.value.r_data.eq(count),
+                    getattr(core, f"tcp_close_{name}").eq(peer_closed),
+                ]
+                with m.If(tx.valid & tx.ready):
+                    m.d.sync += [pattern.eq(pattern + 1),
+                                 count.eq(count + 1)]
+                with m.If(~connected):
+                    m.d.sync += pattern.eq(0)
+            else:
+                echo = PacketFIFO(eth_stream_signature(),
+                                  payload_depth=2048, packet_depth=8)
+                m.submodules[f"tcp_echo_{name}"] = echo
+                connect(m, rx, echo.i_stream)
+                connect(m, echo.o_stream, tx)
+
+                rx_bytes = Signal(32)
+                tx_bytes = Signal(32)
+                with m.If(rx.valid & rx.ready):
+                    m.d.sync += rx_bytes.eq(rx_bytes + 1)
+                with m.If(tx.valid & tx.ready):
+                    m.d.sync += tx_bytes.eq(tx_bytes + 1)
+                m.d.comb += getattr(core, f"tcp_close_{name}").eq(
+                    peer_closed & (rx_bytes == tx_bytes))
+
             m.d.comb += [
-                getattr(core, f"tcp_close_{name}").eq(
-                    getattr(core, f"tcp_peer_closed_{name}") &
-                    (rx_bytes == tx_bytes)),
                 getattr(core, f"tcp_port_{name}")
                     .eq(self.tcp_port_regs[i].f.value.data),
-                self.tcp_status.f.value.r_data[2*i]
-                    .eq(getattr(core, f"tcp_connected_{name}")),
-                self.tcp_status.f.value.r_data[2*i + 1]
-                    .eq(getattr(core, f"tcp_peer_closed_{name}")),
+                self.tcp_status.f.value.r_data[2*i].eq(connected),
+                self.tcp_status.f.value.r_data[2*i + 1].eq(peer_closed),
             ]
             if spec.mode == "client":
                 ip_reg, port_reg = self.tcp_remote_regs[name]
@@ -413,6 +461,21 @@ def main():
                              "forever; LOCAL = fixed source port)")
     parser.add_argument("--no-tcp", action="store_true",
                         help="Build without any TCP logic")
+    parser.add_argument("--tcp-mss", type=int, default=536,
+                        help="TCP segment size limit / advertised MSS "
+                             "(default 536; 1460 fills ethernet frames)")
+    parser.add_argument("--tcp-rx-depth", type=int, default=2048,
+                        help="TCP RX buffer per endpoint = advertised "
+                             "window (BRAM bytes)")
+    parser.add_argument("--rx-cdc-depth", type=int, default=512,
+                        help="MAC RX CDC FIFO depth in 32-bit words (raise "
+                             "to absorb window-sized bursts when benching)")
+    parser.add_argument("--tcp-bench", action="store_true",
+                        help="Replace the first two TCP echo servers with a "
+                             "byte sink (port A, PC->FPGA) and a pattern "
+                             "source (port B, FPGA->PC); see "
+                             "scripts/tcp_bench.py and the bench_*_bytes "
+                             "CSRs")
     parser.add_argument("--no-icmp", action="store_true",
                         help="Build without the ICMP echo responder")
     parser.add_argument("--dhcp", action="store_true",
@@ -437,7 +500,9 @@ def main():
                 local_port=int(parts[2]) if len(parts) > 2 else None))
     top = UDPEcho(mac_addr=args.mac, ip_addr=args.ip, with_icmp=not args.no_icmp,
                   udp_ports=udp_ports, tcp_ports=tcp_ports,
-                  with_dhcp=args.dhcp)
+                  with_dhcp=args.dhcp, tcp_mss=args.tcp_mss,
+                  tcp_rx_depth=args.tcp_rx_depth,
+                  rx_cdc_depth=args.rx_cdc_depth, tcp_bench=args.tcp_bench)
     if args.dhcp:
         print("IP address: DHCP (read the lease from the dhcp_ip CSR)")
     print(f"UDP echo streams: "

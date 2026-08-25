@@ -702,6 +702,132 @@ def test_fin_after_gap_dup_acked():
     sim.run()
 
 
+# MSS -------------------------------------------------------------------------------------------
+
+def test_synack_advertises_mss():
+    """SYN-ACK carries the MSS option matching the build parameter."""
+    dut = TCPEchoDUT([2000], tcp_mss=1460, tcp_rx_depth=4096)
+    sim = make_sim(dut)
+    core = dut.core
+
+    async def tb(ctx):
+        await arp_handshake(ctx, core)
+        peer = Peer(core, 44030, 2000)
+        synack = await peer.connect(ctx)
+        assert synack.tcp_data_offset == 6
+        assert synack.tcp_options == bytes([2, 4]) + (1460).to_bytes(2, "big")
+        await peer.send_data(ctx, b"options ok")
+        await peer.expect_echo(ctx, b"options ok")
+
+    sim.add_testbench(tb)
+    sim.run()
+
+
+def test_peer_mss_caps_segments():
+    """Our data segments never exceed the peer's advertised MSS."""
+    dut = TCPEchoDUT([2000], tcp_mss=1000)
+    sim = make_sim(dut)
+    core = dut.core
+    payload = bytes(i & 0xff for i in range(250))
+
+    async def tb(ctx):
+        await arp_handshake(ctx, core)
+        peer = Peer(core, 44031, 2000)
+        await peer.connect(ctx, options=bytes([2, 4, 0, 100]))   # MSS 100.
+        await peer.send_data(ctx, payload)
+        # Collect the echo; every data segment must be <= 100 bytes and the
+        # first full segment exactly 100 (cut at the peer's MSS).
+        data = b""
+        sizes = []
+        acked = False
+        while not (acked and data == payload):
+            seg = await peer.recv_seg(ctx)
+            if seg.tcp_ack == peer.seq and seg.tcp_flag_ack:
+                acked = True
+            if seg.tcp_payload:
+                sizes.append(len(seg.tcp_payload))
+                data += seg.tcp_payload
+                peer.ack = (peer.ack + len(seg.tcp_payload)) & 0xffffffff
+                await peer.send(ctx, TCP_ACK)
+        assert max(sizes) <= 100 and sizes[0] == 100
+
+    sim.add_testbench(tb)
+    sim.run()
+
+
+def test_no_peer_mss_falls_back_to_536():
+    """Without a peer MSS option the send limit is 536 even with big
+    buffers."""
+    dut = TCPEchoDUT([2000], tcp_mss=1460, tcp_rx_depth=4096)
+    sim = make_sim(dut)
+    core = dut.core
+    payload = bytes(i & 0xff for i in range(700))
+
+    async def tb(ctx):
+        await arp_handshake(ctx, core)
+        peer = Peer(core, 44032, 2000)
+        await peer.connect(ctx)                  # No options.
+        await peer.send_data(ctx, payload)
+        data = b""
+        sizes = []
+        acked = False
+        while not (acked and data == payload):
+            seg = await peer.recv_seg(ctx)
+            if seg.tcp_ack == peer.seq and seg.tcp_flag_ack:
+                acked = True
+            if seg.tcp_payload:
+                sizes.append(len(seg.tcp_payload))
+                data += seg.tcp_payload
+                peer.ack = (peer.ack + len(seg.tcp_payload)) & 0xffffffff
+                await peer.send(ctx, TCP_ACK)
+        assert sizes[0] == 536 and max(sizes) <= 536
+
+    sim.add_testbench(tb)
+    sim.run()
+
+
+def test_client_syn_mss_negotiation():
+    """The client's SYN advertises our MSS; the server's SYN-ACK MSS caps
+    what we send."""
+    dut = TCPEchoDUT([TCPClient(HOST_IP, 5001, local_port=49200)],
+                     tcp_mss=1200, tcp_rx_depth=4096)
+    sim = make_sim(dut)
+    core = dut.core
+
+    async def tb(ctx):
+        await arp_handshake(ctx, core)
+        server = ServerPeer(core, 5001)
+        syn = await server.wait_syn(ctx)
+        assert syn.tcp_options == bytes([2, 4]) + (1200).to_bytes(2, "big")
+        # Answer with our own MSS option of 128.
+        peer = Peer(core, 5001, syn.tcp_src_port, seq=server.iss)
+        peer.ack = (syn.tcp_seq + 1) & 0xffffffff
+        await peer.send(ctx, TCP_SYN | TCP_ACK,
+                        options=bytes([2, 4, 0, 128]))
+        peer.seq += 1
+        ack = await peer.recv_seg(ctx)
+        assert ack.tcp_flag_ack and ack.tcp_ack == peer.seq
+
+        payload = bytes(i & 0xff for i in range(300))
+        await peer.send_data(ctx, payload)
+        data = b""
+        sizes = []
+        acked = False
+        while not (acked and data == payload):
+            seg = await peer.recv_seg(ctx)
+            if seg.tcp_ack == peer.seq and seg.tcp_flag_ack:
+                acked = True
+            if seg.tcp_payload:
+                sizes.append(len(seg.tcp_payload))
+                data += seg.tcp_payload
+                peer.ack = (peer.ack + len(seg.tcp_payload)) & 0xffffffff
+                await peer.send(ctx, TCP_ACK)
+        assert max(sizes) <= 128 and sizes[0] == 128
+
+    sim.add_testbench(tb)
+    sim.run()
+
+
 # Client mode -----------------------------------------------------------------------------------
 
 def test_client_connects_and_echoes():
