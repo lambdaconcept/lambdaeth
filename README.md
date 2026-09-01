@@ -6,15 +6,18 @@ a port of [LiteEth](https://github.com/enjoy-digital/liteeth) built on
 extended well beyond the original with a TCP engine (server *and* client)
 and a DHCP client.
 
-Everything below is verified in simulation (141 tests) **and on real
-hardware** — a Sipeed Tang Mega 138K Pro dock (Gowin GW5AST-138B, RTL8211F
-RGMII PHY) talking to Linux hosts on a live LAN, including binding a lease
-from a production DHCP server.
+Everything below is verified in simulation (155 tests) **and on real
+hardware** — a Sipeed Tang Mega 138K Pro dock (Gowin GW5AST-138B) talking to
+Linux hosts on a live LAN, over both the RTL8211F **RGMII** PHY and the
+GTR12 hard-SERDES **1000BASE-X (SFP)** PHY, including binding a lease from a
+production DHCP server and Clause 37 autonegotiation against commercial
+switches on two SFP cages at once.
 
 ## Features
 
 | Layer | What you get |
 |---|---|
+| PHY | **RGMII** (Gowin GW5A IOLOGIC) and **1000BASE-X / SGMII** (IEEE 802.3 Clause 36/37 PCS on the Gowin GTR12 hard SERDES via [gowin-serdes](https://github.com/key2/gowin-serdes)) |
 | MAC | Preamble/SFD, CRC32 FCS insert/check, min-frame padding, IPG, RX/TX clock-domain crossing, 8↔32-bit width conversion, store-and-forward TX (no mid-frame underruns) |
 | ARP | Responder + resolver with a small cache, request retry/timeout |
 | IPv4 | Header checksum generate/verify, broadcast TX (no ARP), length metadata fan-out |
@@ -31,7 +34,8 @@ wiring, asserted by tests).
 ## Architecture
 
 ```
-RGMII pads ── GW5RGMIIPHY (eth_tx/eth_rx @125 MHz, 8-bit eth_phy streams)
+RGMII pads ── GW5RGMIIPHY ─────────┐ (eth_tx/eth_rx @125 MHz, 8-bit eth_phy streams)
+SFP ── GTR12 ── GW51000BASEXPHY ───┤
                   │ tx/rx
               MACCore(data_width=32)      preamble/CRC/padding/gap + CDC
                   │ sink/source (32-bit eth_phy streams, sync @50 MHz)
@@ -60,7 +64,9 @@ workspace/
 ├── lambdaeth/          # this repository
 ├── amaranth-soc/       # https://github.com/key2/amaranth-soc        @ 559658d
 ├── amaranth-stream/    # https://github.com/key2/amaranth-stream     @ fc42307
-└── amaranth-boards/    # https://github.com/amaranth-lang/amaranth-boards @ f270d21 + patches/amaranth-boards.diff
+├── amaranth-boards/    # https://github.com/amaranth-lang/amaranth-boards @ f270d21 + patches/amaranth-boards.diff
+└── PHY/
+    └── gowin-serdes/   # https://github.com/key2/gowin-serdes (GTR12 SERDES, for the 1000BASE-X PHY)
 ```
 
 ```sh
@@ -68,12 +74,13 @@ git clone https://github.com/key2/lambdaeth
 git clone https://github.com/key2/amaranth-soc
 git clone https://github.com/key2/amaranth-stream
 git clone https://github.com/amaranth-lang/amaranth-boards
+git clone https://github.com/key2/gowin-serdes PHY/gowin-serdes
 
 git -C amaranth-boards apply ../lambdaeth/patches/amaranth-boards.diff   # Tang Mega 138K Pro: RGMII/ephy_clk resources, UART pins, GW5A part parsing
 
 cd lambdaeth
 pdm install          # Python >= 3.11; installs the siblings as editable deps
-pdm run pytest -q    # 145 tests
+pdm run pytest -q    # 155 tests
 ```
 
 ## Usage
@@ -186,7 +193,7 @@ fall back to a fresh discovery on expiry.
 138K Pro dock: PHY + MAC + core + echo fabrics + a UART→Wishbone→CSR bridge
 exposing MAC/IP/ports/counters/status (see `scripts/csrctl.py`).
 
-## Hardware demo (Tang Mega 138K Pro dock)
+## Hardware demo — RGMII (Tang Mega 138K Pro dock)
 
 ```sh
 # Build (Gowin IDE; the wrapper fixes env quirks — set GOWIN_IDE to your install):
@@ -245,6 +252,60 @@ to the user buffer) ⇒ 50 MHz / 2 = 25 MB/s. Download is stop-and-wait
 (one segment per round trip, ~195 µs each at MSS 1460); a small in-flight
 window would be the next step if that direction ever matters.
 
+## Hardware demo — 1000BASE-X over SFP (GTR12 SERDES)
+
+`lambdaeth/phy/pcs_1000basex.py` is a vendor-independent port of LiteEth's
+1000BASE-X PCS reshaped for transceivers whose *hard* PCS performs the
+8b/10b coding and comma alignment: the fabric exchanges decoded code groups
+(`{disparity, k, data}` TX / `{coding_err, disparity_err, k, data}` RX) and
+keeps the Clause 36 ordered-set framing plus the full Clause 37
+autonegotiation FSM (1000BASE-X and SGMII, auto-detected from the partner).
+Notable deltas vs. LiteEth: a `RunningDisparity` tracker feeds the hard
+encoder's starting-disparity hint, `ability_match` ignores the ACK bit per
+IEEE (LiteEth's variant deadlocks when two of its own instances negotiate),
+frames are also delimited by `last` (back-to-back safe), and an `an_bypass`
+control forces the link up for partners with autonegotiation disabled.
+
+`lambdaeth/phy/gw5_1000basex.py` wraps it for the Gowin GTR12
+(via [gowin-serdes](https://github.com/key2/gowin-serdes): 1.25 Gb/s, CPLL,
+10-bit fabric width, 8b10b + K28.5 alignment — the generated CSR blob is
+byte-identical to the Gowin IDE 1GSERETH reference), with the vendor
+`serdes_control` reset sequencing (PMA reset after PLL-OK, `eth_rx` reset
+gated on word alignment) and CSRs for reset/an_bypass/status/lp_abi.
+
+`examples/tang_mega_138k_1000basex.py` drives both SFP cages of the dock at
+once (GTR12 quad 1 lanes 0/1, 125 MHz on Q1 REFPAD0): lane 0 carries the
+full UDP/TCP/ICMP stack, lane 1 an autoneg-only partner PHY, plus per-lane
+RX frame counters and CSR-armable 64-byte frame sniffers. SFP TX_DISABLE
+(R18/M20) is driven low — a floating pin leaves the module lasers off — and
+RX_LOS (V18/W18) is readable in `core__sfp_status`.
+
+```sh
+# Self-test without SFP modules: serdes near-end loopback, the PHY
+# negotiates against itself and the TCP stack connects to itself:
+GW_SH=$PWD/scripts/gw_sh_wrapper pdm run python examples/tang_mega_138k_1000basex.py \
+    --loopback nes --tcp-client 192.168.10.60:2000
+sudo openFPGALoader -b tangmega138k --ftdi-serial 2023102515 \
+    build/tang_mega_138k_1000basex/basex_echo.fs
+CSR="pdm run python scripts/csrctl.py --port /dev/ttyUSB9 --csr-map build/tang_mega_138k_1000basex/csr.json"
+$CSR read phy__status        # -> 0x0d = link_up | pll_ok | align_link
+$CSR read core__tcp_status   # -> 0x11 = server + self-connecting client ESTABLISHED
+
+# Real link: build without --loopback, plug SFP modules:
+GW_SH=$PWD/scripts/gw_sh_wrapper pdm run python examples/tang_mega_138k_1000basex.py
+ping -c 3 192.168.10.60                     # over the fiber, via SFP0
+$CSR read phy1__lp_abi                      # SFP1 partner ability word
+$CSR write core__snap_ctrl 3                # arm both frame sniffers
+$CSR read core__snap1_w0                    # ... captured frame bytes (w0..w15)
+```
+
+Verified on hardware: both lanes autonegotiate simultaneously against
+commercial switches (`lp_abi` 0x41a0 / 0x4020), ICMP/UDP/TCP echo run
+end-to-end over the fiber (ping ~0.23 ms), and the lane-1 sniffer captured
+live link-local traffic — a Pioneer CDJ-3000 PRO DJ LINK keep-alive
+broadcast (169.254.116.4 → 169.254.255.255, UDP 50000, `"Qspt1WmJOL"`
+signature) decoded through the hard 8b10b + fabric PCS.
+
 ## Host-side tools
 
 | Script | Purpose |
@@ -283,13 +344,16 @@ window would be the next step if that direction ever matters.
   probing / gratuitous announce / DECLINE / RELEASE.
 * CRC-errored frames are flagged but not dropped ahead of the core (a
   corrupt frame can desync one packet; self-recovering).
+* 1000BASE-X PCS: SGMII framing (bit 0 mirroring, speed bits) is implemented
+  and simulated, but only the gigabit rate is hardware-proven; 10/100 byte
+  repetition is untested on hardware.
 * Sustained throughput is capped by the byte-wide core (~400 Mbps at
   50 MHz); the wire side still runs true gigabit bursts.
 
 ## Testing
 
 ```sh
-pdm run pytest -q          # 145 tests
+pdm run pytest -q          # 155 tests
 ```
 
 Layer tests drive plain MAC frames against Python reference
