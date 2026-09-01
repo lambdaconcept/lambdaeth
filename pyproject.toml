@@ -26,6 +26,7 @@ dev = [
     "-e file:///${PROJECT_ROOT}/../amaranth-soc#egg=amaranth-soc",
     "-e file:///${PROJECT_ROOT}/../amaranth-stream#egg=amaranth-stream",
     "-e file:///${PROJECT_ROOT}/../amaranth-boards#egg=amaranth-boards",
+    "-e file:///${PROJECT_ROOT}/../PHY/gowin-serdes#egg=gowin-serdes",
 ]
 
 [tool.pdm.scripts]
