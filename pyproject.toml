@@ -45,3 +45,7 @@ filterwarnings = [
 dev = [
     "pytest>=8.0",
 ]
+ecp5 = [
+    "yowasp-yosys>=0.69.0.0.post1233",
+    "yowasp-nextpnr-ecp5>=0.11.1.0.post826",
+]

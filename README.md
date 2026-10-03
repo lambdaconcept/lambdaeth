@@ -6,18 +6,19 @@ a port of [LiteEth](https://github.com/enjoy-digital/liteeth) built on
 extended well beyond the original with a TCP engine (server *and* client)
 and a DHCP client.
 
-Everything below is verified in simulation (155 tests) **and on real
-hardware** — a Sipeed Tang Mega 138K Pro dock (Gowin GW5AST-138B) talking to
-Linux hosts on a live LAN, over both the RTL8211F **RGMII** PHY and the
-GTR12 hard-SERDES **1000BASE-X (SFP)** PHY, including binding a lease from a
-production DHCP server and Clause 37 autonegotiation against commercial
-switches on two SFP cages at once.
+Everything below is verified in simulation (165 tests) **and on real
+hardware** — a Sipeed Tang Mega 138K Pro dock (Gowin GW5AST-138B) and a
+LambdaConcept ECPIX-5 (Lattice ECP5-5G, fully open-source Yosys + nextpnr
+flow) talking to Linux hosts on a live LAN, over **RGMII** PHYs (RTL8211F,
+KSZ9031) and the GTR12 hard-SERDES **1000BASE-X (SFP)** PHY, including
+binding a lease from a production DHCP server and Clause 37 autonegotiation
+against commercial switches on two SFP cages at once.
 
 ## Features
 
 | Layer | What you get |
 |---|---|
-| PHY | **RGMII** (Gowin GW5A IOLOGIC) and **1000BASE-X / SGMII** (IEEE 802.3 Clause 36/37 PCS on the Gowin GTR12 hard SERDES via [gowin-serdes](https://github.com/key2/gowin-serdes)) |
+| PHY | **RGMII** on Gowin GW5A (IOLOGIC ODDR/IDDR/IODELAY) and on Lattice ECP5 (ODDRX1F/IDDRX1F/DELAYG, in-band link status CSR), and **1000BASE-X / SGMII** (IEEE 802.3 Clause 36/37 PCS on the Gowin GTR12 hard SERDES via [gowin-serdes](https://github.com/key2/gowin-serdes)) |
 | MAC | Preamble/SFD, CRC32 FCS insert/check, min-frame padding, IPG, RX/TX clock-domain crossing, 8↔32-bit width conversion, store-and-forward TX (no mid-frame underruns) |
 | ARP | Responder + resolver with a small cache, request retry/timeout |
 | IPv4 | Header checksum generate/verify, broadcast TX (no ARP), length metadata fan-out |
@@ -35,6 +36,7 @@ wiring, asserted by tests).
 
 ```
 RGMII pads ── GW5RGMIIPHY ─────────┐ (eth_tx/eth_rx @125 MHz, 8-bit eth_phy streams)
+RGMII pads ── ECP5RGMIIPHY ────────┤
 SFP ── GTR12 ── GW51000BASEXPHY ───┤
                   │ tx/rx
               MACCore(data_width=32)      preamble/CRC/padding/gap + CDC
@@ -63,7 +65,7 @@ LambdaEth expects its (patched) dependencies as sibling checkouts:
 workspace/
 ├── lambdaeth/          # this repository
 ├── amaranth-soc/       # https://github.com/key2/amaranth-soc        @ 559658d
-├── amaranth-stream/    # https://github.com/key2/amaranth-stream     @ fc42307
+├── amaranth-stream/    # https://github.com/key2/amaranth-stream     @ df133d7
 ├── amaranth-boards/    # https://github.com/amaranth-lang/amaranth-boards @ f270d21 + patches/amaranth-boards.diff
 └── PHY/
     └── gowin-serdes/   # https://github.com/key2/gowin-serdes (GTR12 SERDES, for the 1000BASE-X PHY)
@@ -80,8 +82,17 @@ git -C amaranth-boards apply ../lambdaeth/patches/amaranth-boards.diff   # Tang 
 
 cd lambdaeth
 pdm install          # Python >= 3.11; installs the siblings as editable deps
-pdm run pytest -q    # 155 tests
+pdm install -G ecp5  # optional: YoWASP yosys/nextpnr-ecp5/ecppack for the ECP5 (ECPIX-5) demo
+pdm run pytest -q    # 165 tests
 ```
+
+The ECP5 flow needs no vendor tool: `pdm install -G ecp5` pulls the
+pip-packaged [YoWASP](https://yowasp.org/) builds of Yosys, nextpnr-ecp5 and
+ecppack (WebAssembly; nextpnr runs at native speed) and the ECPIX-5 example
+picks them up automatically when no native `yosys`/`nextpnr-ecp5`/`ecppack`
+is on `PATH` (a native [OSS CAD Suite](https://github.com/YosysHQ/oss-cad-suite-build)
+works too; `YOSYS`/`NEXTPNR_ECP5`/`ECPPACK` override). The Gowin demos need
+the Gowin IDE.
 
 ## Usage
 
@@ -252,6 +263,45 @@ to the user buffer) ⇒ 50 MHz / 2 = 25 MB/s. Download is stop-and-wait
 (one segment per round trip, ~195 µs each at MSS 1460); a small in-flight
 window would be the next step if that direction ever matters.
 
+## Hardware demo — RGMII on Lattice ECP5 (LambdaConcept ECPIX-5, open toolchain)
+
+`lambdaeth/phy/ecp5rgmii.py` is the ECP5 RGMII PHY (same ports, streams and
+CSR style as the Gowin one): `ODDRX1F`/`IDDRX1F` DDR pads behind static
+`DELAYG` skews — TX clock +2 ns, RX 0 ns by default, LiteX's values for the
+ECPIX-5's KSZ9031RNX (`--tx-delay`/`--rx-delay` in ns to tune) — plus a
+`phy__inband_status` CSR (RGMII in-band link up / speed / duplex) and the
+bit-banged MDIO CSRs. `examples/ecpix5_udp_echo.py` is the same demo as the
+Tang Mega one (identical network fabric, CSR map and host tools): `clk100`
+→ EHXPLLL → 50 MHz `sync`, the PHY held in reset for 20 ms at power-up, and
+the PHY CSRs mapped as a `phy` window next to the `core` registers.
+
+```sh
+pdm install -G ecp5                                   # once: YoWASP yosys/nextpnr-ecp5/ecppack
+pdm run python examples/ecpix5_udp_echo.py --ip 192.168.10.50   # ~3 min on an 85F (same flags as the Tang demo)
+
+# Flash (SRAM, volatile). The r03 board has an on-board FT4232H: channel A = JTAG.
+sudo openFPGALoader -b ecpix5_r03 build/ecpix5_udp_echo/udp_echo.bit
+sleep 4                                               # KSZ9031 autonegotiation
+
+ping -c 5 192.168.10.50
+pdm run python scripts/udp_echo_test.py --ip 192.168.10.50 --expect-drop-port 9999
+pdm run python scripts/tcp_echo_test.py --ip 192.168.10.50
+
+# CSRs: the UART bridge is on FT4232H channel C (usb-FTDI_Quad_RS232-HS-if02-port0,
+# usually /dev/ttyUSB3; `modprobe ftdi_sio` if no ttyUSB appears):
+CSR="pdm run python scripts/csrctl.py --port /dev/ttyUSB3 --csr-map build/ecpix5_udp_echo/csr.json"
+$CSR dump
+$CSR read phy__inband_status    # -> 0x0d = link up | 1000 Mbps | full duplex
+```
+
+Measured on an ECPIX-5 85F r03 (LFE5UM5G-85F-8, nextpnr 0.11): Fmax
+eth_rx 137.7 MHz (125 required) / sys 73.9 MHz (50 required), 17 % LUTs,
+38 block RAMs; ICMP RTT ~0.16 ms, UDP echo RTT ~75 µs (64 B) / ~205 µs
+(1400 B), TCP echo ~71 kB/s per connection (stop-and-wait), zero RX errors
+through 3000+ frames including a `ping -f`. Porting to another ECP5 board is
+the top-level file only: request the RGMII pads with `dir="-"`, wire them
+through `IOBufferInstance`s to the PHY, and constrain the RX clock pad.
+
 ## Hardware demo — 1000BASE-X over SFP (GTR12 SERDES)
 
 `lambdaeth/phy/pcs_1000basex.py` is a vendor-independent port of LiteEth's
@@ -328,6 +378,11 @@ signature) decoded through the hard 8b10b + fabric PCS.
   a buffered segment before anything acts on it, TCP TX keeps a replay
   buffer for retransmission, and the RX chain is never held hostage by a
   stalled user (dup-ACK + drop instead).
+* **Block-RAM-shaped buffers**: every `PacketFIFO` and the TCP buffers read
+  their storage synchronously (prefetch register in front of the output), so
+  yosys/nextpnr and the vendor tools map them to block RAM. The same design
+  that fills 123 % of an ECP5-85F with LUT-RAM FIFOs takes 17 % with
+  synchronous reads.
 * **Sequence arithmetic is equality-only** in the in-order TCP engine, which
   makes it wraparound-safe by construction.
 * Timers (ARP, TCP RTO/idle/reconnect, DHCP retry/lease) all derive from
@@ -353,7 +408,7 @@ signature) decoded through the hard 8b10b + fabric PCS.
 ## Testing
 
 ```sh
-pdm run pytest -q          # 155 tests
+pdm run pytest -q          # 165 tests
 ```
 
 Layer tests drive plain MAC frames against Python reference
