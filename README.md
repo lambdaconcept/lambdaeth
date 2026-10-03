@@ -298,8 +298,11 @@ Measured on an ECPIX-5 85F r03 (LFE5UM5G-85F-8, nextpnr 0.11): Fmax
 eth_rx 137.7 MHz (125 required) / sys 73.9 MHz (50 required), 17 % LUTs,
 38 block RAMs; ICMP RTT ~0.16 ms, UDP echo RTT ~75 µs (64 B) / ~205 µs
 (1400 B), TCP echo ~71 kB/s per connection (stop-and-wait), zero RX errors
-through 3000+ frames including a `ping -f`. Porting to another ECP5 board is
-the top-level file only: request the RGMII pads with `dir="-"`, wire them
+through 3000+ frames including a `ping -f`. The `--tcp-bench --tcp-mss 1460
+--tcp-rx-depth 8192 --rx-cdc-depth 4096` build (40 block RAMs, eth_rx
+145.6 / sys 77.0 MHz) measures **24.7 MB/s upload / 8.3 MB/s download** —
+the same core ceiling as on the Gowin board. Porting to another ECP5 board
+is the top-level file only: request the RGMII pads with `dir="-"`, wire them
 through `IOBufferInstance`s to the PHY, and constrain the RX clock pad.
 
 ## Hardware demo — 1000BASE-X over SFP (GTR12 SERDES)
